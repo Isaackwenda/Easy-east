@@ -1,0 +1,243 @@
+from flask import Flask, request, send_from_directory, jsonify, render_template_string, redirect, url_for
+from werkzeug.utils import secure_filename
+import os
+from pathlib import Path
+
+APP_DIR = Path(__file__).parent.resolve()
+UPLOAD_FOLDER = APP_DIR / 'uploads'
+UPLOAD_FOLDER.mkdir(exist_ok=True)
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = str(UPLOAD_FOLDER)
+app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024 * 1024  # 1 GB per request (adjust as needed)
+
+# Simple HTML template embedded to keep single-file app
+HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>FileDrop — Upload & Download</title>
+  <style>
+    :root{
+      --blue:#1e6fdf; /* main */
+      --light:#f7fbff; /* background */
+      --accent:#ff7a2d; /* orange */
+      --muted:#6b7280;
+      --max-width:900px;
+    }
+    *{box-sizing:border-box}
+    body{font-family:Inter, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial; background:var(--light); color:#0f1724; margin:0; padding:24px; display:flex; justify-content:center}
+    .card{width:100%; max-width:var(--max-width); background:white; border-radius:12px; box-shadow:0 6px 24px rgba(15,23,42,0.08); padding:20px}
+    h1{margin:0 0 8px; font-size:20px; color:var(--blue)}
+    p.lead{margin:0 0 18px; color:var(--muted)}
+
+    /* Drop area */
+    .drop{height:210px; border:2px dashed rgba(30,111,223,0.18); border-radius:12px; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:12px; background:linear-gradient(180deg, rgba(30,111,223,0.03), transparent)}
+    .drop.dragover{border-color:var(--accent); box-shadow:0 8px 30px rgba(255,122,45,0.08)}
+    .hint{color:var(--muted)}
+    .btn{display:inline-flex; align-items:center; gap:8px; padding:10px 14px; border-radius:10px; cursor:pointer; border:none; font-weight:600}
+    .btn-primary{background:var(--blue); color:white}
+    .btn-ghost{background:transparent; color:var(--blue); border:1px solid rgba(30,111,223,0.12)}
+    .btn-accent{background:var(--accent); color:white}
+
+    .controls{display:flex; gap:8px; margin-top:12px}
+    input[type=file]{display:none}
+
+    .files{margin-top:18px}
+    .file{display:flex; align-items:center; justify-content:space-between; padding:10px; border-radius:8px; border:1px solid #eef2ff; margin-bottom:8px}
+    .meta{display:flex; gap:12px; align-items:center}
+    .name{font-weight:600}
+    .small{font-size:12px; color:var(--muted)}
+
+    .progress{height:8px; background:#eef2ff; border-radius:999px; overflow:hidden; width:180px}
+    .progress > i{display:block; height:100%; width:0%; background:linear-gradient(90deg,var(--blue),var(--accent));}
+
+    footer{margin-top:18px; font-size:13px; color:var(--muted)}
+
+    @media(max-width:560px){.controls{flex-direction:column}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>FileDrop</h1>
+    <p class="lead">Upload files quickly — drag & drop or use the picker. Files are stored temporarily without accounts.</p>
+
+    <div id="drop" class="drop">
+      <div style="text-align:center">
+        <strong>Drop files here</strong>
+        <div class="hint">or use the button to choose files</div>
+      </div>
+      <div class="controls">
+        <label class="btn btn-primary" for="fileinput">Choose files</label>
+        <button id="refreshBtn" class="btn btn-ghost">Refresh list</button>
+        <button id="clearBtn" class="btn btn-accent">Clear uploads</button>
+      </div>
+      <input id="fileinput" type="file" multiple>
+    </div>
+
+    <div class="files" id="filesList"></div>
+
+    <footer>Note: This demo stores files in <code>/uploads</code>. Don't expose without proper security.</footer>
+  </div>
+
+  <script>
+    const drop = document.getElementById('drop');
+    const fileinput = document.getElementById('fileinput');
+    const filesList = document.getElementById('filesList');
+    const refreshBtn = document.getElementById('refreshBtn');
+    const clearBtn = document.getElementById('clearBtn');
+
+    function prevent(e){e.preventDefault(); e.stopPropagation();}
+
+    ['dragenter','dragover'].forEach(ev=>{
+      drop.addEventListener(ev, e=>{prevent(e); drop.classList.add('dragover');});
+    });
+    ['dragleave','drop'].forEach(ev=>{
+      drop.addEventListener(ev, e=>{prevent(e); drop.classList.remove('dragover');});
+    });
+
+    drop.addEventListener('drop', async (e)=>{
+      const items = e.dataTransfer.files;
+      if(items.length) await uploadFiles(items);
+    });
+
+    fileinput.addEventListener('change', async (e)=>{
+      const items = e.target.files;
+      if(items.length) await uploadFiles(items);
+      fileinput.value = ''; // reset
+    });
+
+    refreshBtn.addEventListener('click', ()=>loadFiles());
+    clearBtn.addEventListener('click', async ()=>{
+      if(!confirm('Delete ALL uploaded files?')) return;
+      const res = await fetch('/clear', {method:'POST'});
+      if(res.ok) loadFiles(); else alert('Failed to clear');
+    });
+
+    async function uploadFiles(fileList){
+      for(let i=0;i<fileList.length;i++){
+        const file = fileList[i];
+        await uploadSingle(file);
+      }
+      await loadFiles();
+    }
+
+    async function uploadSingle(file){
+      const form = new FormData();
+      form.append('file', file);
+
+      // UI row
+      const row = document.createElement('div'); row.className='file';
+      row.innerHTML = `<div class='meta'><div class='name'>${escapeHtml(file.name)}</div><div class='small'>${formatBytes(file.size)}</div></div><div class='progress'><i></i></div>`;
+      filesList.prepend(row);
+      const bar = row.querySelector('.progress > i');
+
+      try{
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST','/upload');
+        xhr.upload.onprogress = function(e){ if(e.lengthComputable){ const pct = Math.round((e.loaded/e.total)*100); bar.style.width = pct + '%'; }};
+        await new Promise((resolve,reject)=>{
+          xhr.onload = ()=>{ if(xhr.status===200) resolve(); else reject(xhr.responseText); };
+          xhr.onerror = ()=>reject('Network error');
+          xhr.send(form);
+        });
+      }catch(err){
+        row.querySelector('.meta').insertAdjacentHTML('beforeend', `<div class='small' style='color:#b91c1c'> Failed</div>`);
+      }
+    }
+
+    async function loadFiles(){
+      const res = await fetch('/files');
+      const list = await res.json();
+      filesList.innerHTML='';
+      if(list.length===0){ filesList.innerHTML = '<div class="small">No files uploaded yet</div>'; return; }
+      list.forEach(f=>{
+        const el = document.createElement('div'); el.className='file';
+        el.innerHTML = `<div class='meta'><div><div class='name'>${escapeHtml(f.name)}</div><div class='small'>${escapeHtml(f.size_readable)} · ${escapeHtml(f.time)}</div></div></div>
+          <div style='display:flex;gap:8px;align-items:center'><a class='btn btn-ghost' href='/download/${encodeURIComponent(f.name)}'>Download</a></div>`;
+        filesList.appendChild(el);
+      });
+    }
+
+    function formatBytes(bytes){
+      if(bytes===0) return '0 B';
+      const k=1024; const sizes=['B','KB','MB','GB','TB'];
+      const i=Math.floor(Math.log(bytes)/Math.log(k));
+      return parseFloat((bytes/Math.pow(k,i)).toFixed(2)) + ' ' + sizes[i];
+    }
+
+    function escapeHtml(str){ return str.replace(/[&<>'"`]/g, s=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;","`":"&#x60;"}[s])); }
+
+    // initial load
+    loadFiles();
+  </script>
+</body>
+</html>
+"""
+
+from datetime import datetime
+
+@app.route('/')
+def index():
+    return render_template_string(HTML)
+
+@app.route('/upload', methods=['POST'])
+def upload():
+    if 'file' not in request.files:
+        return 'No file part', 400
+    f = request.files['file']
+    if f.filename == '':
+        return 'No selected file', 400
+    filename = secure_filename(f.filename)
+    dest = Path(app.config['UPLOAD_FOLDER']) / filename
+    # ensure unique filename
+    counter = 1
+    base = dest.stem
+    ext = dest.suffix
+    while dest.exists():
+        dest = Path(app.config['UPLOAD_FOLDER']) / f"{base}({counter}){ext}"
+        counter += 1
+    f.save(dest)
+    return 'OK'
+
+@app.route('/files')
+def list_files():
+    files = []
+    for p in sorted(Path(app.config['UPLOAD_FOLDER']).iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
+        if p.is_file():
+            files.append({
+                'name': p.name,
+                'size': p.stat().st_size,
+                'size_readable': human_readable_size(p.stat().st_size),
+                'time': datetime.fromtimestamp(p.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+            })
+    return jsonify(files)
+
+@app.route('/download/<path:filename>')
+def download(filename):
+    # send file from uploads
+    safe = secure_filename(filename)
+    return send_from_directory(app.config['UPLOAD_FOLDER'], safe, as_attachment=True)
+
+@app.route('/clear', methods=['POST'])
+def clear():
+    # delete all files in uploads
+    try:
+        for p in Path(app.config['UPLOAD_FOLDER']).iterdir():
+            if p.is_file(): p.unlink()
+        return 'OK'
+    except Exception as e:
+        return str(e), 500
+
+def human_readable_size(n):
+    for unit in ['B','KB','MB','GB','TB']:
+        if n < 1024.0:
+            return f"{n:3.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} PB"
+
+if __name__ == '__main__':
+    # Use 0.0.0.0 if you want to access from other devices on the network
+    app.run(host='127.0.0.1', port=5000, debug=True)
